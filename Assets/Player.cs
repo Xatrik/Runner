@@ -1,4 +1,5 @@
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 /// <summary>
 /// Physics-based first-person movement in the Source/Quake tradition: rigidbody
@@ -125,10 +126,23 @@ public class Player : MonoBehaviour
     [SerializeField] private float kickRecoilLock = 0.25f;
     [SerializeField] private float kickRecoilDrag = 1.5f;
 
+    [Header("Death")]
+    [Tooltip("Drives the Global Volume's Color Adjustments saturation on death. Auto-found in the scene if left empty.")]
+    [SerializeField] private DeathColorEffect deathGrayscale;
+    [Tooltip("Screen shake added the instant you die (reuses the same trauma system as the kick).")]
+    [SerializeField] private float deathShakeTrauma = 1f;
+    [Tooltip("Seconds to lerp Time.timeScale from 1 down to 0 after death.")]
+    [SerializeField] private float deathTimeScaleDuration = 1f;
+    [Tooltip("Ignore R for this long after death, so a stray key-repeat can't instantly skip the death feedback.")]
+    [SerializeField] private float minTimeBeforeRestart = 0.4f;
+
+    private float deathTime;
+
     public Vector3 Velocity => rb != null ? rb.velocity : Vector3.zero;
     public float HorizontalSpeed { get { var v = Velocity; v.y = 0f; return v.magnitude; } }
     public bool IsGrounded => grounded;
     public bool IsSliding => sliding;
+    public bool IsDead { get; private set; }
 
     private Rigidbody rb;
     private CapsuleCollider capsule;
@@ -198,6 +212,8 @@ public class Player : MonoBehaviour
             cameraTransform = Camera.main.transform;
         if (kickAnimator == null)
             kickAnimator = GetComponentInChildren<Animator>();
+        if (deathGrayscale == null)
+            deathGrayscale = FindObjectOfType<DeathColorEffect>();
 
         standHeight = capsule.height;
         targetHeight = standHeight;
@@ -213,7 +229,52 @@ public class Player : MonoBehaviour
 
     private void OnDisable()
     {
-        if (hitStopActive) { Time.timeScale = 1f; hitStopActive = false; } // never leave a hit-stop running
+        // Never leave the game stuck in slow-mo/hit-stop/paused.
+        if (hitStopActive || IsDead) { Time.timeScale = 1f; hitStopActive = false; }
+    }
+
+    /// Call this to kill the player (e.g. Bullet.cs on contact). Safe to call more
+    /// than once — only the first call does anything. Freezes the player in
+    /// place, kicks off a screen shake + grayscale fade, lerps Time.timeScale
+    /// down to 0, and waits for R to reload the scene.
+    public void Kill()
+    {
+        if (IsDead) return;
+        IsDead = true;
+        deathTime = Time.unscaledTime;
+
+        rb.velocity = Vector3.zero;
+        rb.isKinematic = true; // stop all physics response, freeze exactly in place
+        moveInput = Vector2.zero; // so the camera lean settles back to neutral
+
+        wantCursorLocked = false;
+        ApplyCursorLock();
+
+        shakeTrauma = Mathf.Clamp01(shakeTrauma + deathShakeTrauma);
+        if (deathGrayscale != null) deathGrayscale.SetTarget(1f);
+
+        // Note: Update/FixedUpdate keep running (gated by IsDead below) rather
+        // than disabling the component outright, so LateUpdate can keep
+        // animating the shake and the camera can keep rendering the fade.
+    }
+
+    private void UpdateDeathScreen()
+    {
+        float elapsed = Time.unscaledTime - deathTime;
+
+        // Slide the world to a stop. Driven by unscaled time since scaled time
+        // itself grinds to a halt as timeScale approaches 0.
+        float t = Mathf.Clamp01(elapsed / deathTimeScaleDuration);
+        Time.timeScale = Mathf.Lerp(1f, 0f, t);
+
+        if (elapsed >= minTimeBeforeRestart && Input.GetKeyDown(KeyCode.R))
+            Restart();
+    }
+
+    private void Restart()
+    {
+        Time.timeScale = 1f; // don't reload into a paused-looking scene
+        SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
     }
 
     private void OnApplicationFocus(bool focused)
@@ -229,6 +290,12 @@ public class Player : MonoBehaviour
 
     private void Update()
     {
+        if (IsDead)
+        {
+            UpdateDeathScreen();
+            return;
+        }
+
         // Esc releases the cursor, a click recaptures it. Re-asserted every frame
         // so nothing (alt-tab, the editor, UI) can quietly steal the lock.
         if (Input.GetKeyDown(KeyCode.Escape)) wantCursorLocked = false;
@@ -331,6 +398,8 @@ public class Player : MonoBehaviour
 
     private void FixedUpdate()
     {
+        if (IsDead) return; // frozen (kinematic) — nothing to simulate
+
         float dt = Time.fixedDeltaTime;
 
         GroundCheck();
